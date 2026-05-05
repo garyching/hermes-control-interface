@@ -1,5 +1,19 @@
 # Deployment Guide
 
+## Apple Silicon (ARM64) Note
+
+If deploying on an Apple Silicon Mac, the `better-sqlite3` native addon may ship as
+`x86_64` and fail to load. See `docs/BETTER_SQLITE3.md` for the full fix documentation.
+
+**Quick fix:**
+1. Ensure `sqlite3` CLI is available (`which sqlite3`)
+2. Ensure `hermes` is in the launchd PATH (add `~/Users/<you>/.local/bin` to the plist)
+3. Apply the compatibility patch: `git am patches/better-sqlite3-compat.patch`
+4. Rebuild: `npm run build`
+5. Restart: `launchctl stop com.hermes.control-interface` then `launchctl start com.hermes.control-interface`
+
+---
+
 ## Prerequisites
 
 - Node.js 20+

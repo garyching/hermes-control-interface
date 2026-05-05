@@ -196,7 +196,83 @@ Check the logs:
 sudo journalctl -u hermes-control -n 50
 ```
 
-Common issues:
+## Common Issues
+
+### better-sqlite3 — incompatible architecture
+
+**Error in stderr log:**
+```
+dlopen(...better_sqlite3.node): incompatible architecture (have 'x86_64', need 'arm64e')
+```
+
+**Cause:** The `better-sqlite3` prebuilt binary is x86_64 but the host is Apple Silicon.
+
+**Fix:** Apply the compatibility patch and rebuild:
+```bash
+git am patches/better-sqlite3-compat.patch
+npm run build
+launchctl stop com.hermes.control-interface
+launchctl start com.hermes.control-interface
+```
+
+See `docs/BETTER_SQLITE3.md` for full documentation.
+
+---
+
+### Chat — clicking session shows "Welcome to Chat" / no messages
+
+**Cause:** same `better-sqlite3` issue — the `/api/sessions/:id/messages` endpoint crashes.
+
+**Fix:** Same as above. After the patch, session messages load via `hermes sessions export` CLI.
+
+---
+
+### Skills Hub — blank / "No skills found"
+
+**Cause:** `hermes` CLI not in launchd PATH.
+
+**Fix:** Add `~/.local/bin` to the plist PATH variable:
+```xml
+<key>PATH</key>
+<string>/Users/chengjiahui/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+```
+
+---
+
+### Chat — sending message does nothing
+
+**Cause:** WebSocket ping timeout — `sendViaWebSocket()` Promise hangs forever, CLI fallback never runs.
+
+**Fix:** After the frontend rebuild (`npm run build`), a 15-second WS timeout is applied.
+If WS doesn't respond, it automatically falls back to CLI mode.
+
+---
+
+### Session list — all sessions show "0 msgs"
+
+**Cause:** `loadSessionsFromDb()` crashes on `new Database()`.
+
+**Fix:** After the patch, sessions show correct message counts from `sqlite3 -json` CLI query.
+
+---
+
+### Usage page — labels with no values / "Models No data"
+
+**Cause:** `/api/usage/:days` and `/api/usage/daily/:days` both use `new Database()`.
+
+**Fix:** After the patch, overview stats come from `hermes insights` CLI, and daily charts
+from `sqlite3 -json` CLI queries.
+
+---
+
+### Agent name — model name leaked into profile name in agents list
+
+On the Agents page, a profile named `product-manager` with model `ark-code-latest`
+appears as `product-manager ark-code-latest Status ...` because the HCI's table parser
+splits on 2+ spaces, but the profile name is long enough that only 1 space separates it
+from the model name.
+
+**Fix:** Rename long profile names to ≤12 characters. Not a code bug.
 - Wrong `WorkingDirectory` in the service file
 - Missing `.env` — systemd doesn't load it automatically. Either set `Environment=` vars in the service file, or use `EnvironmentFile=/path/to/.env`
 - `node` not on PATH — use the absolute path in `ExecStart`, e.g. `/usr/bin/node`

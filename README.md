@@ -3,7 +3,10 @@
 A self-hosted web dashboard for the [Hermes AI agent](https://github.com/NousResearch/hermes-agent) stack. Manage terminals, files, sessions, cron jobs, token analytics, multi-agent gateways, and team access — all behind a password gate.
 
 **Stack:** Vanilla JS + Vite · Node.js · Express · WebSocket · xterm.js
-**Version:** 3.5.0
+**Version:** 3.5.1
+
+> **⚠ Apple Silicon users:** See [BETTER_SQLITE3.md](docs/BETTER_SQLITE3.md) for
+> the better-sqlite3 compatibility fix if you experience blank pages or missing data.
 
 ---
 
