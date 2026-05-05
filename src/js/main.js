@@ -586,7 +586,7 @@ async function refreshChatSidebar() {
     // Normalize source
     function normalizeSource(s) {
       const src = s.source;
-      if (!src) return 'other';
+      if (!src) return 'cli';
       if (src === 'api_server') return 'api_server';
       return src;
     }
@@ -1740,7 +1740,7 @@ function showChatError(error) {
   if (sendBtn) sendBtn.style.display = '';
 }
 
-// ── Send via WebSocket ──
+  // ── Send via WebSocket ──
 async function sendViaWebSocket(text, profile, sessionId) {
   return new Promise((resolve, reject) => {
     const messagesDiv = document.getElementById('chat-messages');
@@ -1768,14 +1768,22 @@ async function sendViaWebSocket(text, profile, sessionId) {
     if (stopBtn) stopBtn.style.display = '';
     if (sendBtn) sendBtn.style.display = 'none';
 
+    // Timeout: if WS doesn't respond within 15s, reject and fall back to CLI
+    const wsTimeout = setTimeout(() => {
+      wsClient.removeEventListener('message', onDone);
+      reject(new Error('WebSocket timeout (15s)'));
+    }, 15000);
+
     // One-time listener for completion
     function onDone(ev) {
       const msg = ev.detail;
       if (msg.type === 'chat.done') {
+        clearTimeout(wsTimeout);
         wsClient.removeEventListener('message', onDone);
         finalizeWsChat();
         resolve();
       } else if (msg.type === 'chat.error') {
+        clearTimeout(wsTimeout);
         wsClient.removeEventListener('message', onDone);
         showChatError(msg.error);
         reject(new Error(msg.error));
@@ -1786,6 +1794,7 @@ async function sendViaWebSocket(text, profile, sessionId) {
     // Send via WS
     const ok = wsClient.chatStart({ message: text, profile, session_id: sessionId });
     if (!ok) {
+      clearTimeout(wsTimeout);
       wsClient.removeEventListener('message', onDone);
       reject(new Error('WebSocket not connected'));
     }

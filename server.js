@@ -1384,46 +1384,66 @@ function getStateDbPath(profile) {
 function loadSessionsFromDb(stateDbPath, limit = 250) {
   if (!fs.existsSync(stateDbPath)) return { dbSessions: [], previewBySessionId: {}, lastActivityBySessionId: {} };
 
-  const db = new Database(stateDbPath, { readonly: true });
   try {
-    const dbSessions = db.prepare(`
-      SELECT id, title, parent_session_id, started_at, ended_at, message_count, source
-      FROM sessions
-      ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
-      LIMIT ?
-    `).all(limit);
+    const db = new Database(stateDbPath, { readonly: true });
+    try {
+      const dbSessions = db.prepare(`
+        SELECT id, title, parent_session_id, started_at, ended_at, message_count, source
+        FROM sessions
+        ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+        LIMIT ?
+      `).all(limit);
 
-    const previewRows = db.prepare(`
-      SELECT session_id, content
-      FROM messages
-      WHERE id IN (
-        SELECT MAX(id)
+      const previewRows = db.prepare(`
+        SELECT session_id, content
         FROM messages
-        WHERE content IS NOT NULL AND TRIM(content) != ''
+        WHERE id IN (
+          SELECT MAX(id)
+          FROM messages
+          WHERE content IS NOT NULL AND TRIM(content) != ''
+          GROUP BY session_id
+        )
+      `).all();
+
+      const previewBySessionId = {};
+      for (const row of previewRows) {
+        previewBySessionId[row.session_id] = row.content;
+      }
+
+      // Last activity per session (most recent message timestamp)
+      const lastActivityRows = db.prepare(`
+        SELECT session_id, MAX(timestamp) as last_activity
+        FROM messages
         GROUP BY session_id
-      )
-    `).all();
+      `).all();
 
-    const previewBySessionId = {};
-    for (const row of previewRows) {
-      previewBySessionId[row.session_id] = row.content;
+      const lastActivityBySessionId = {};
+      for (const row of lastActivityRows) {
+        lastActivityBySessionId[row.session_id] = row.last_activity;
+      }
+
+      return { dbSessions, previewBySessionId, lastActivityBySessionId };
+    } finally {
+      db.close();
     }
+  } catch {
+    // Native addon failed (arch mismatch, locked DB, etc.) — use sqlite3 CLI as fallback
+    return loadSessionsFromDbCli(stateDbPath, limit);
+  }
+}
 
-    // Last activity per session (most recent message timestamp)
-    const lastActivityRows = db.prepare(`
-      SELECT session_id, MAX(timestamp) as last_activity
-      FROM messages
-      GROUP BY session_id
-    `).all();
-
-    const lastActivityBySessionId = {};
-    for (const row of lastActivityRows) {
-      lastActivityBySessionId[row.session_id] = row.last_activity;
-    }
-
-    return { dbSessions, previewBySessionId, lastActivityBySessionId };
-  } finally {
-    db.close();
+// Fallback: use sqlite3 CLI to query message counts (resilient to arch mismatches)
+function loadSessionsFromDbCli(stateDbPath, limit = 250) {
+  try {
+    const { execFileSync } = require('child_process');
+    // Exclude cron sessions from main list, include source for filtering
+    const raw = execFileSync('sqlite3', ['-json', stateDbPath,
+      `SELECT id, COALESCE(message_count, 0) as message_count, COALESCE(source, 'cli') as source FROM sessions WHERE source IS NULL OR source != 'cron' ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT ${parseInt(limit)}`
+    ], { encoding: 'utf8', timeout: 5000 });
+    const dbSessions = JSON.parse(raw);
+    return { dbSessions, previewBySessionId: {}, lastActivityBySessionId: {} };
+  } catch {
+    return { dbSessions: [], previewBySessionId: {}, lastActivityBySessionId: {} };
   }
 }
 
@@ -1433,17 +1453,22 @@ async function getAllSessions(profile) {
   if (hermesAllSessionsCache.data.length && now - hermesAllSessionsCache.at < 10_000 && hermesAllSessionsCache.key === cacheKey) {
     return hermesAllSessionsCache.data;
   }
-  const cmd = profile ? `hermes -p ${profile} sessions list --limit 250` : 'hermes sessions list --limit 250';
-  const raw = await shell(cmd);
+  const args = profile ? ['-p', profile, 'sessions', 'list', '--limit', '250'] : ['sessions', 'list', '--limit', '250'];
+  const raw = await execHermes(args, 15000);
   if (raw) {
     const cliSessions = parseHermesSessionsList(raw);
     const stateDbPath = getStateDbPath(profile);
-    const { dbSessions, previewBySessionId, lastActivityBySessionId } = loadSessionsFromDb(stateDbPath);
+    let dbData;
+    try {
+      dbData = loadSessionsFromDb(stateDbPath);
+    } catch {
+      dbData = { dbSessions: [], previewBySessionId: {}, lastActivityBySessionId: {} };
+    }
     const data = mergeSessionsFromSources({
       cliSessions,
-      dbSessions,
-      previewBySessionId,
-      lastActivityBySessionId,
+      dbSessions: dbData.dbSessions,
+      previewBySessionId: dbData.previewBySessionId,
+      lastActivityBySessionId: dbData.lastActivityBySessionId,
       nowMs: now,
     });
     hermesAllSessionsCache = { at: now, data, key: cacheKey };
@@ -4068,7 +4093,7 @@ app.get('/api/sessions/:id/export', requireAuth, async (req, res) => {
 
 // Session messages — Phase 1: Message Viewer
 
-app.get('/api/sessions/:id/messages', requireAuth, (req, res) => {
+app.get('/api/sessions/:id/messages', requireAuth, async (req, res) => {
   try {
     const sessionId = sanitizeSessionId(req.params.id);
     if (!sessionId) return res.status(400).json({ ok: false, error: 'invalid session id' });
@@ -4079,43 +4104,77 @@ app.get('/api/sessions/:id/messages', requireAuth, (req, res) => {
       ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
       : path.join(os.homedir(), '.hermes', 'state.db');
 
-    if (!fs.existsSync(stateDbPath)) {
-      return res.json({ ok: false, error: `state.db not found for profile: ${profile || 'default'}` });
-    }
+    // Try reading from DB first
+    if (fs.existsSync(stateDbPath)) {
+      try {
+        const db = new Database(stateDbPath, { readonly: true });
+        try {
+          // Get session metadata
+          const session = db.prepare(`
+            SELECT id, source, model, title, started_at, ended_at,
+                   message_count, tool_call_count, input_tokens, output_tokens,
+                   estimated_cost_usd
+            FROM sessions WHERE id = ?
+          `).get(sessionId);
 
-    const db = new Database(stateDbPath, { readonly: true });
-    try {
-      // Get session metadata
-      const session = db.prepare(`
-        SELECT id, source, model, title, started_at, ended_at,
-               message_count, tool_call_count, input_tokens, output_tokens,
-               estimated_cost_usd
-        FROM sessions WHERE id = ?
-      `).get(sessionId);
+          if (!session) {
+            return res.json({ ok: false, error: 'Session not found' });
+          }
 
-      if (!session) {
-        return res.json({ ok: false, error: 'Session not found' });
+          // Get messages
+          const messages = db.prepare(`
+            SELECT id, role, content, tool_calls, tool_name, timestamp,
+                   reasoning, finish_reason
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY timestamp ASC
+          `).all(sessionId);
+
+          // Parse tool_calls JSON strings
+          const parsed = messages.map(m => ({
+            ...m,
+            tool_calls: m.tool_calls ? JSON.parse(m.tool_calls) : null,
+          }));
+
+          return res.json({ ok: true, session, messages: parsed });
+        } finally {
+          db.close();
+        }
+      } catch (_dbErr) {
+        // DB read failed (e.g. native addon arch mismatch) — fall through to CLI
       }
-
-      // Get messages
-      const messages = db.prepare(`
-        SELECT id, role, content, tool_calls, tool_name, timestamp,
-               reasoning, finish_reason
-        FROM messages
-        WHERE session_id = ?
-        ORDER BY timestamp ASC
-      `).all(sessionId);
-
-      // Parse tool_calls JSON strings
-      const parsed = messages.map(m => ({
-        ...m,
-        tool_calls: m.tool_calls ? JSON.parse(m.tool_calls) : null,
-      }));
-
-      res.json({ ok: true, session, messages: parsed });
-    } finally {
-      db.close();
     }
+
+    // Fallback: export session via CLI (60s timeout for large sessions)
+    const tmpFile = `/tmp/session-${crypto.randomUUID()}.jsonl`;
+    const output = await execHermes(['sessions', 'export', tmpFile, '--session-id', sessionId], 60000);
+    const data = await fs.promises.readFile(tmpFile, 'utf8').catch(() => output);
+    await fs.promises.unlink(tmpFile).catch(() => {});
+    const lines = (data || output || '').split('\n').filter(Boolean);
+    const messages = [];
+    let sessionMeta = { id: sessionId };
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.messages && Array.isArray(obj.messages)) {
+          sessionMeta = { id: obj.id, source: obj.source, title: obj.title, message_count: obj.message_count };
+          for (const m of obj.messages) {
+            let toolCalls = m.tool_calls || null;
+            if (typeof toolCalls === 'string') {
+              try { toolCalls = JSON.parse(toolCalls); } catch { toolCalls = null; }
+            }
+            messages.push({
+              id: m.id, role: m.role, content: m.content,
+              tool_calls: toolCalls,
+              timestamp: m.timestamp,
+            });
+          }
+        }
+      } catch (e) {
+        console.error('[CLI export parse error]', e.message);
+      }
+    }
+    res.json({ ok: true, session: sessionMeta, messages });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -4154,140 +4213,8 @@ app.get('/api/usage/:days', requireAuth, requirePerm('usage.view'), async (req, 
   try {
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
     const profile = sanitizeProfileName(req.query.profile) || undefined;
-
-    // Determine which state.db paths to query
-    let dbPaths = [];
-    if (profile) {
-      const p = profile !== 'default'
-        ? path.join(os.homedir(), '.hermes', 'profiles', profile, 'state.db')
-        : path.join(os.homedir(), '.hermes', 'state.db');
-      if (!fs.existsSync(p)) return res.json({ ok: false, error: 'state.db not found' });
-      dbPaths = [{ profile: profile || 'default', path: p }];
-    } else {
-      // All profiles
-      const profilesDir = path.join(os.homedir(), '.hermes', 'profiles');
-      if (fs.existsSync(profilesDir)) {
-        for (const entry of fs.readdirSync(profilesDir, { withFileTypes: true })) {
-          if (!entry.isDirectory()) continue;
-          const dbPath = path.join(profilesDir, entry.name, 'state.db');
-          if (fs.existsSync(dbPath)) dbPaths.push({ profile: entry.name, path: dbPath });
-        }
-      }
-      // Include default profile
-      const defaultDbPath = path.join(os.homedir(), '.hermes', 'state.db');
-      if (fs.existsSync(defaultDbPath)) {
-        dbPaths.push({ profile: 'default', path: defaultDbPath });
-      }
-      if (dbPaths.length === 0) return res.json({ ok: false, error: 'No state.db found' });
-    }
-
-    // Aggregate across all DBs
-    const modelMap = {};
-    const platformMap = {};
-    const toolMap = {};
-    let totalSessions = 0, totalMessages = 0, totalToolCalls = 0;
-    let totalInput = 0, totalOutput = 0, totalCost = 0;
-
-    for (const { path: dbPath } of dbPaths) {
-      const db = new Database(dbPath, { readonly: true });
-      try {
-        const since = `-${days}`;
-        const sessions = db.prepare(`
-          SELECT model, source, billing_provider,
-                 input_tokens, output_tokens, cache_read_tokens,
-                 message_count, tool_call_count
-          FROM sessions
-          WHERE started_at > strftime('%s', 'now', ? || ' days')
-        `).all(since);
-
-        for (const s of sessions) {
-          const cost = calculateCost(s.model, s.input_tokens || 0, s.output_tokens || 0, s.cache_read_tokens || 0, s.billing_provider);
-          const tokens = (s.input_tokens || 0) + (s.output_tokens || 0);
-
-          totalSessions++;
-          totalInput += s.input_tokens || 0;
-          totalOutput += s.output_tokens || 0;
-          totalCost += cost;
-          totalMessages += s.message_count || 0;
-          totalToolCalls += s.tool_call_count || 0;
-
-          const mKey = s.model || 'unknown';
-          if (!modelMap[mKey]) modelMap[mKey] = { name: mKey, sessions: 0, tokens: 0 };
-          modelMap[mKey].sessions++;
-          modelMap[mKey].tokens += tokens;
-
-          const pKey = s.source || 'unknown';
-          if (!platformMap[pKey]) platformMap[pKey] = { name: pKey, sessions: 0, tokens: 0 };
-          platformMap[pKey].sessions++;
-          platformMap[pKey].tokens += tokens;
-        }
-
-        // Top tools
-        const tools = db.prepare(`
-          SELECT tool_name, COUNT(*) as calls
-          FROM messages
-          WHERE tool_name IS NOT NULL AND tool_name != ''
-            AND timestamp > strftime('%s', 'now', ? || ' days')
-          GROUP BY tool_name
-          ORDER BY calls DESC
-          LIMIT 10
-        `).all(since);
-
-        for (const t of (tools || [])) {
-          if (!toolMap[t.tool_name]) toolMap[t.tool_name] = { name: t.tool_name, calls: 0 };
-          toolMap[t.tool_name].calls += t.calls;
-        }
-      } finally {
-        db.close();
-      }
-    }
-
-    // Calculate active time (avg session duration)
-    let avgDuration = 0;
-    for (const { path: dbPath } of dbPaths) {
-      const db = new Database(dbPath, { readonly: true });
-      try {
-        const dur = db.prepare(`
-          SELECT AVG(ended_at - started_at) as avg_dur
-          FROM sessions
-          WHERE started_at > strftime('%s', 'now', ? || ' days') AND ended_at > 0
-        `).get(`-${days}`);
-        if (dur?.avg_dur) avgDuration += dur.avg_dur;
-      } finally {
-        db.close();
-      }
-    }
-    avgDuration = dbPaths.length > 0 ? avgDuration / dbPaths.length : 0;
-
-    // Format active time
-    const formatDuration = (secs) => {
-      if (!secs || secs < 60) return '—';
-      const h = Math.floor(secs / 3600);
-      const m = Math.floor((secs % 3600) / 60);
-      return h > 0 ? `${h}h ${m}m` : `${m}m`;
-    };
-
-    const topTools = Object.values(toolMap)
-      .sort((a, b) => b.calls - a.calls)
-      .slice(0, 5)
-      .map(t => ({ ...t, pct: totalToolCalls > 0 ? ((t.calls / totalToolCalls) * 100).toFixed(1) + '%' : '0%' }));
-
-    res.json({
-      ok: true,
-      sessions: totalSessions,
-      messages: totalMessages,
-      toolCalls: totalToolCalls,
-      inputTokens: totalInput,
-      outputTokens: totalOutput,
-      totalTokens: totalInput + totalOutput,
-      cost: '$' + totalCost.toFixed(2),
-      activeTime: formatDuration(avgDuration),
-      avgSession: formatDuration(avgDuration),
-      period: `${days} days${profile ? ` (${profile})` : ' (all profiles)'}`,
-      models: Object.values(modelMap).sort((a, b) => b.tokens - a.tokens),
-      platforms: Object.values(platformMap).sort((a, b) => b.sessions - a.sessions),
-      topTools,
-    });
+    const data = await getInsights(days, profile);
+    res.json({ ok: true, ...data, period: `${days} days${profile ? ` (${profile})` : ' (all profiles)'}` });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -4361,7 +4288,7 @@ function parseInsights(raw) {
   return data;
 }
 
-// Daily usage breakdown (for charts) — queries state.db directly
+// Daily usage breakdown (for charts)
 app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async (req, res) => {
   try {
     const days = Math.min(parseInt(req.params.days || '7', 10), 90);
@@ -4374,7 +4301,14 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
       return res.json({ ok: false, error: 'state.db not found' });
     }
 
-    const db = new Database(stateDbPath, { readonly: true });
+    // Try reading from native addon first
+    let db;
+    try {
+      db = new Database(stateDbPath, { readonly: true });
+    } catch {
+      // Native addon failed — use sqlite3 CLI
+      return await getDailyViaCli(stateDbPath, days, res);
+    }
     try {
       const since = `-${days}`;
 
@@ -4445,39 +4379,26 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
       const topTools = db.prepare(`
         SELECT tool_name, COUNT(*) as calls
         FROM messages
-        WHERE tool_name IS NOT NULL
-          AND tool_name != ''
+        WHERE tool_name IS NOT NULL AND tool_name != ''
           AND timestamp > strftime('%s', 'now', ? || ' days')
         GROUP BY tool_name
         ORDER BY calls DESC
         LIMIT 10
       `).all(since);
 
-      // Avg duration
-      const avgDur = db.prepare(`
-        SELECT AVG(ended_at - started_at) as avg_duration
-        FROM sessions
-        WHERE started_at > strftime('%s', 'now', ? || ' days')
-      `).get(since);
-
       res.json({
         ok: true,
-        days,
         daily,
         byModel,
         byPlatform,
         byHour: byHour || [],
-        topTools: topTools || [],
-        totals: {
-          sessions: totalSessions,
-          input_tokens: totalInput,
-          output_tokens: totalOutput,
-          total_tokens: totalInput + totalOutput,
-          cost: totalCost,
-          messages: totalMessages,
-          tool_calls: totalToolCalls,
-          avg_duration: avgDur?.avg_duration || 0,
-        },
+        topTools: (topTools || []).slice(0, 5),
+        totalSessions,
+        totalInput,
+        totalOutput,
+        totalCost,
+        totalMessages,
+        totalToolCalls,
       });
     } finally {
       db.close();
@@ -4486,6 +4407,72 @@ app.get('/api/usage/daily/:days', requireAuth, requirePerm('usage.view'), async 
     res.json({ ok: false, error: e.message });
   }
 });
+
+// Fallback: query daily usage via sqlite3 CLI when native addon fails
+async function getDailyViaCli(stateDbPath, days, res) {
+  try {
+    const { execFileSync } = require('child_process');
+    // 1. Daily aggregation
+    const dailyRaw = execFileSync('sqlite3', ['-json', stateDbPath, `
+      SELECT
+        DATE(started_at, 'unixepoch', 'localtime') as date,
+        COUNT(*) as sessions,
+        COALESCE(SUM(input_tokens), 0) as input_tokens,
+        COALESCE(SUM(output_tokens), 0) as output_tokens,
+        COALESCE(SUM(input_tokens + output_tokens), 0) as total_tokens,
+        COALESCE(SUM(message_count), 0) as messages,
+        COALESCE(SUM(tool_call_count), 0) as tool_calls
+      FROM sessions
+      WHERE started_at > strftime('%s', 'now', '-${days} days')
+      GROUP BY date
+      ORDER BY date ASC
+    `], { encoding: 'utf8', timeout: 10000 });
+    const daily = JSON.parse(dailyRaw || '[]');
+
+    // 2. By hour
+    const hourRaw = execFileSync('sqlite3', ['-json', stateDbPath, `
+      SELECT
+        CAST(strftime('%H', started_at, 'unixepoch', 'localtime') AS INTEGER) as hour,
+        COUNT(*) as sessions,
+        COALESCE(SUM(input_tokens + output_tokens), 0) as total_tokens
+      FROM sessions
+      WHERE started_at > strftime('%s', 'now', '-${days} days')
+      GROUP BY hour
+      ORDER BY hour ASC
+    `], { encoding: 'utf8', timeout: 5000 });
+    const byHour = JSON.parse(hourRaw || '[]');
+
+    // 3. Totals
+    const totalRaw = execFileSync('sqlite3', ['-json', stateDbPath, `
+      SELECT
+        COUNT(*) as sessions,
+        COALESCE(SUM(input_tokens), 0) as totalInput,
+        COALESCE(SUM(output_tokens), 0) as totalOutput,
+        COALESCE(SUM(message_count), 0) as totalMessages,
+        COALESCE(SUM(tool_call_count), 0) as totalToolCalls
+      FROM sessions
+      WHERE started_at > strftime('%s', 'now', '-${days} days')
+    `], { encoding: 'utf8', timeout: 5000 });
+    const totals = JSON.parse(totalRaw || '[{}]')[0] || {};
+
+    res.json({
+      ok: true,
+      daily,
+      byModel: [],
+      byPlatform: [],
+      byHour,
+      topTools: [],
+      totalSessions: totals.sessions || 0,
+      totalInput: totals.totalInput || 0,
+      totalOutput: totals.totalOutput || 0,
+      totalCost: 0,
+      totalMessages: totals.totalMessages || 0,
+      totalToolCalls: totals.totalToolCalls || 0,
+    });
+  } catch (e) {
+    res.json({ ok: true, daily: [], totalSessions: 0, totalMessages: 0, totalCost: 0, periods: [] });
+  }
+}
 
 // Create agent (profile)
 app.post('/api/profiles/create', requireRole('admin'), requireCsrf, async (req, res) => {
