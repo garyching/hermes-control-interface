@@ -1,32 +1,40 @@
 ---
-name: Bug Report
+name: Bug report
 about: Report a bug to help us improve
 title: "[BUG] "
 labels: bug
 assignees: ''
 ---
 
-**Describe the bug**
-A clear description of what the bug is.
+## Describe the Bug
 
-**To Reproduce**
-Steps to reproduce:
+A clear and concise description of what the bug is.
+
+## To Reproduce
+
+Steps to reproduce the behavior:
 1. Go to '...'
 2. Click on '...'
-3. See error
+3. Scroll down to '...'
+4. See error
 
-**Expected behavior**
-What you expected to happen.
+## Expected Behavior
 
-**Screenshots**
-If applicable, add screenshots.
+A clear description of what you expected to happen.
 
-**Environment:**
-- OS: [e.g. Ubuntu 22.04]
-- Node.js version: [e.g. 20.11.0]
-- Browser: [e.g. Chrome 120, Firefox 115]
-- Hermes version: [e.g. 0.8.0]
-- HCI version: [e.g. 1.4.0]
+## Screenshots / Logs
 
-**Additional context**
-Any other context about the problem.
+If applicable, add screenshots or error logs to help explain your problem.
+
+## Environment
+
+- **macOS version:** (e.g. 15.4, or `sw_vers`)
+- **Architecture:** (Apple Silicon / Intel)
+- **Node.js version:** (`node --version`)
+- **HCI version:** (`grep '"version"' package.json`)
+- **Deployment method:** (launchd / systemd / manual)
+- **Has `better-sqlite3` native addon loaded?** (check stderr for arch errors)
+
+## Additional Context
+
+Add any other context about the problem here.
