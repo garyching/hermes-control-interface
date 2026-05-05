@@ -276,7 +276,16 @@ app.use('/plugins/:id', (req, res, next) => {
   const plugin = plugins.find(p => p.id === req.params.id);
   if (!plugin) return res.status(404).json({ error: 'plugin not found' });
   if (plugin.status === 'locked') return res.status(402).json({ error: 'premium required', price: plugin.price });
-  express.static(plugin.uiPath, { maxAge: '1h' })(req, res, next);
+  express.static(plugin.uiPath, {
+    maxAge: '24h',
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('.html')) {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+      }
+    },
+  })(req, res, next);
 });
 
 const events = [];
@@ -415,6 +424,250 @@ function getDefaultModel(profile) {
 app.get('/api/gateway/ports', requireAuth, (req, res) => {
   res.json({ ports: gatewayPorts, profiles: Object.keys(gatewayPorts) });
 });
+
+// ── 和美系统 Agent Status ──
+// GET /api/hemei/status — returns profiles, roles, gateway state, and system health
+app.get('/api/hemei/status', async (req, res) => {
+  const HERMES_HOME = path.join(os.homedir(), '.hermes');
+  const profiles = [];
+  let systemInfo = { health: 'unknown', version: 'unknown', tasks_completed: 0 };
+
+  // Read system-level AGENTS.md for top-level status
+  try {
+    const agentsPaths = [
+      path.join(HERMES_HOME, 'AGENTS.md'),
+      '/Users/chengjiahui/GaryTeams/AGENTS.md',
+      '/Users/chengjiahui/.hermes/hermes-agent/AGENTS.md',
+    ];
+    for (const agentsPath of agentsPaths) {
+      if (fs.existsSync(agentsPath)) {
+        const content = fs.readFileSync(agentsPath, 'utf8');
+        const healthMatch = content.match(/(?:System Health Score|系统运行健康度)\s*\|\s*(\d+%)/);
+        const verMatch = content.match(/Current Version:\s*([\S]+)/);
+        const tasksMatch = content.match(/Optimizations Applied\s*\|\s*(\d+)/);
+        systemInfo = {
+          health: healthMatch ? healthMatch[1] : '99%',
+          version: verMatch ? verMatch[1] : 'v1.12.87',
+          tasks_completed: tasksMatch ? parseInt(tasksMatch[1], 10) : 0,
+        };
+        break;
+      }
+    }
+  } catch (_) { /* fallback */ }
+
+  // Run hermes profile list
+  const raw = await shell('hermes profile list');
+  const lines = raw.split('\n').filter(l => l.trim());
+
+  // Determine which profiles are "active" by checking the current profile
+  let activeProfile = 'default';
+  try {
+    const activeRaw = await shell('hermes profile current 2>/dev/null || echo default');
+    activeProfile = activeRaw.trim().toLowerCase() || 'default';
+  } catch (_) { /* fallback */ }
+
+  // Parse profile list output
+  // Expected formats:
+  //   "* default (active)" or "  default"
+  //   Followed by indented key: value lines
+  let currentProfile = null;
+  let currentAttrs = {};
+
+  for (const line of lines) {
+    // Detect profile header: starts with optional "* " then profile name
+    const profileMatch = line.match(/^[\s*]*(\S+)(?:\s+\((\w+)\))?\s*$/);
+    if (profileMatch) {
+      // Save previous profile if any
+      if (currentProfile) {
+        profiles.push(buildProfileObj(currentProfile, currentAttrs, activeProfile));
+      }
+      currentProfile = profileMatch[1];
+      currentAttrs = { status: profileMatch[2] || '' };
+      continue;
+    }
+
+    // Detect indented key: value lines
+    const attrMatch = line.match(/^\s{2,}(\w[\w\s]*?)\s*[=:]\s*(.+)$/);
+    if (attrMatch && currentProfile) {
+      const key = attrMatch[1].trim().toLowerCase().replace(/\s+/g, '_');
+      currentAttrs[key] = attrMatch[2].trim();
+    }
+  }
+  // Push last profile
+  if (currentProfile) {
+    profiles.push(buildProfileObj(currentProfile, currentAttrs, activeProfile));
+  }
+
+  // If hermes profile list returned nothing useful, fallback to directory scan
+  if (profiles.length === 0) {
+    const profilesDir = path.join(HERMES_HOME, 'profiles');
+    const profileNames = ['default'];
+    try {
+      if (fs.existsSync(profilesDir)) {
+        for (const name of fs.readdirSync(profilesDir)) {
+          const statPath = path.join(profilesDir, name);
+          if (fs.statSync(statPath).isDirectory()) profileNames.push(name);
+        }
+      }
+    } catch (_) { /* ignore */ }
+
+    for (const name of profileNames) {
+      const model = getDefaultModel(name);
+      const gwHealth = await probeGatewayHealth(name);
+      const role = readRoleFromSoul(HERMES_HOME, name);
+      profiles.push({
+        name,
+        active: name === activeProfile,
+        model,
+        gateway: gwHealth.ok ? 'running' : 'stopped',
+        role,
+      });
+    }
+  }
+
+  res.json({
+    ok: true,
+    profiles,
+    system: systemInfo,
+  });
+
+  // ── helpers ──
+
+  function buildProfileObj(name, attrs, activeProfileName) {
+    const model = attrs.model || getDefaultModel(name);
+    const gwStatus = (attrs.gateway || '').toLowerCase();
+    const isActive = name === activeProfileName || attrs.status === 'active';
+    const role = readRoleFromSoul(HERMES_HOME, name);
+    return {
+      name,
+      active: isActive,
+      model,
+      gateway: gwStatus === 'running' || gwStatus === 'active' ? 'running' : 'stopped',
+      role,
+    };
+  }
+
+  function readRoleFromSoul(hermesHome, profileName) {
+    const knownRoles = {
+      'default': '编排器 — 需求识别与分发',
+      'product': '产品经理 — 产品规划、需求分析、UX设计',
+      'tech-expert': '技术专家 — 技术实现、架构设计、代码质量',
+      'data-analyst': '数据分析师 — 数据采集、分析、可视化',
+      'assistant': '通用助理 — 写作、翻译、信息整理',
+      'marketing-expert': '市场分析师 — 市场分析、品牌策略',
+    };
+    try {
+      const soulPath = profileName === 'default'
+        ? path.join(hermesHome, 'PERSONA.md')
+        : path.join(hermesHome, 'profiles', profileName, 'SOUL.md');
+      if (!fs.existsSync(soulPath)) return knownRoles[profileName] || '';
+      const content = fs.readFileSync(soulPath, 'utf8');
+      // Try to find a meaningful 角色描述 section
+      const roleSection = content.match(/##\s*(角色描述|角色)\s*\n([^#]+)/);
+      if (roleSection) {
+        const roleText = roleSection[2].trim().split('\n')[0];
+        if (roleText) return roleText.replace(/^[-\d.\s]+/, '').trim();
+      }
+      // Try first heading
+      const headingMatch = content.match(/^##\s+(.+)/m);
+      if (headingMatch) return headingMatch[1].replace(/^(Name|名称)[:：]?\s*/i, '').trim();
+      return knownRoles[profileName] || '';
+    } catch (_) {
+      return knownRoles[profileName] || '';
+    }
+  }
+});  // end hemei status
+
+// ── 和美系统 任务历史持久化 ──
+const HEMEI_DB_PATH = path.join(os.homedir(), '.hermes', 'hemei_tasks.db');
+function initHemeiDb() {
+  try {
+    const db = new Database(HEMEI_DB_PATH, { fileMustExist: false });
+    db.pragma('journal_mode = WAL');
+    db.exec(`CREATE TABLE IF NOT EXISTS hemei_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT DEFAULT '',
+      created_at TEXT DEFAULT (datetime('now','localtime')),
+      updated_at TEXT DEFAULT (datetime('now','localtime')),
+      goal TEXT NOT NULL, context TEXT DEFAULT '', assigned_to TEXT DEFAULT '',
+      status TEXT DEFAULT 'pending', result_summary TEXT DEFAULT '',
+      result_details TEXT DEFAULT '', parent_task_id INTEGER DEFAULT NULL,
+      duration_seconds REAL DEFAULT NULL, source TEXT DEFAULT 'manual'
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS hemei_task_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+      event_time TEXT DEFAULT (datetime('now','localtime')),
+      event_type TEXT NOT NULL, event_data TEXT DEFAULT ''
+    )`);
+    db.close();
+  } catch(e) { console.error('[hemei] db init:', e.message); }
+}
+initHemeiDb();
+
+function getHemeiDb() { return new Database(HEMEI_DB_PATH); }
+
+app.post('/api/hemei/tasks', async (req, res) => {
+  try {
+    const { goal, context, assigned_to, source } = req.body || {};
+    if (!goal) return res.status(400).json({ error: 'goal required' });
+    const db = getHemeiDb();
+    const info = db.prepare('INSERT INTO hemei_tasks (goal,context,assigned_to,source) VALUES (?,?,?,?)').run(goal,context||'',assigned_to||'',source||'manual');
+    const taskId = info.lastInsertRowid;
+    db.prepare('INSERT INTO hemei_task_events (task_id,event_type,event_data) VALUES (?,?,?)').run(taskId,'created',JSON.stringify({goal,assigned_to}));
+    db.close();
+    res.json({ok:true, task:{id:taskId, goal, assigned_to, status:'pending'}});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.patch('/api/hemei/tasks/:id', async (req, res) => {
+  try {
+    const {id} = req.params;
+    const {status, result_summary, result_details, assigned_to, duration_seconds} = req.body||{};
+    const db = getHemeiDb();
+    const sets = ["updated_at = datetime('now','localtime')"];
+    const vals = [];
+    if(status){sets.push('status=?');vals.push(status);}
+    if(result_summary){sets.push('result_summary=?');vals.push(result_summary);}
+    if(result_details){sets.push('result_details=?');vals.push(result_details);}
+    if(assigned_to){sets.push('assigned_to=?');vals.push(assigned_to);}
+    if(duration_seconds!==undefined){sets.push('duration_seconds=?');vals.push(duration_seconds);}
+    vals.push(id);
+    db.prepare(`UPDATE hemei_tasks SET ${sets.join(',')} WHERE id=?`).run(...vals);
+    if(status) db.prepare('INSERT INTO hemei_task_events (task_id,event_type,event_data) VALUES (?,?,?)').run(id,'status_change',status);
+    const task = db.prepare('SELECT * FROM hemei_tasks WHERE id=?').get(id);
+    db.close();
+    res.json({ok:true, task});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/hemei/tasks', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit)||50, 200);
+    const offset = parseInt(req.query.offset)||0;
+    const status = req.query.status||'';
+    const db = getHemeiDb();
+    let where='', params=[];
+    if(status){where='WHERE status=?';params.push(status);}
+    const total = db.prepare(`SELECT COUNT(*) as count FROM hemei_tasks ${where}`).get(...params).count;
+    const tasks = db.prepare(`SELECT * FROM hemei_tasks ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+    const events = db.prepare('SELECT * FROM hemei_task_events ORDER BY event_time DESC LIMIT 50').all();
+    db.close();
+    res.json({ok:true, tasks, events, total, limit, offset});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/hemei/tasks/stats', async (req, res) => {
+  try {
+    const db = getHemeiDb();
+    const total = db.prepare('SELECT COUNT(*) as count FROM hemei_tasks').get().count;
+    const byStatus = db.prepare('SELECT status,COUNT(*) as count FROM hemei_tasks GROUP BY status').all();
+    const byAgent = db.prepare("SELECT assigned_to,COUNT(*) as count FROM hemei_tasks WHERE assigned_to!='' GROUP BY assigned_to ORDER BY count DESC").all();
+    const avgDuration = db.prepare('SELECT AVG(duration_seconds) as avg FROM hemei_tasks WHERE duration_seconds IS NOT NULL').get().avg||0;
+    const last7days = db.prepare("SELECT date(created_at) as day,COUNT(*) as count FROM hemei_tasks WHERE created_at>=datetime('now','-7 days') GROUP BY day ORDER BY day").all();
+    db.close();
+    res.json({ok:true, total, byStatus, byAgent, avgDuration, last7days});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+// ── End 任务历史 ──
 
 // POST /api/gateway/responses — start a new agent run via Gateway API
 app.post('/api/gateway/responses', requireAuth, requirePerm('chat.use'), async (req, res) => {
@@ -3744,7 +3997,16 @@ app.get('/api/skills/search/:query', requireAuth, async (req, res) => {
 // Skills inspect (preview) — use execHermes to prevent shell injection
 app.get('/api/skills/inspect/:name', requireAuth, async (req, res) => {
   try {
-    const name = decodeURIComponent(req.params.name);
+    let name = decodeURIComponent(req.params.name);
+    // Resolve truncated name
+    if (name.endsWith('…')) {
+      const prefix = name.replace(/…$/, '');
+      const attempt = await execHermes(['skills', 'inspect', prefix], 10000).catch(() => '');
+      const suggestMatch = attempt.match(/\s{2}([\w-]+)\s+[—–]\s/);
+      if (suggestMatch) {
+        name = suggestMatch[1].trim();
+      }
+    }
     const output = await execHermes(['skills', 'inspect', name], 15000);
     res.json({ ok: true, output });
   } catch (e) {
@@ -3768,12 +4030,31 @@ app.get('/api/skills/list/:profile', requireAuth, async (req, res) => {
 // Skills install (with profile picker)
 app.post('/api/skills/install', requireRole('admin'), requireCsrf, async (req, res) => {
   try {
-    const { skill, profile } = req.body || {};
+    let { skill, profile } = req.body || {};
     if (!skill) return res.status(400).json({ ok: false, error: 'skill name required' });
-    if (!/^[\w.\-]+$/.test(skill)) return res.status(400).json({ ok: false, error: 'invalid skill name' });
+
+    // Prof arg for CLI — defined early for truncated name resolution
     const profArg = profile ? ['-p', sanitizeProfileName(profile)] : [];
+
+    // If skill name is truncated (ends with …), resolve full name via install attempt
+    if (skill.endsWith('…')) {
+      const prefix = skill.replace(/…$/, '');
+      // Try install with the truncated prefix — CLI will show "Did you mean?"
+      const attempt = await execHermes([...profArg, 'skills', 'install', prefix, '--yes'], 15000).catch(() => '');
+      const suggestMatch = attempt.match(/\s{2}([\w-]+)\s+[—–]\s/);
+      if (suggestMatch) {
+        skill = suggestMatch[1].trim();
+      }
+      // If the attempt succeeded anyway, return success
+      if (!attempt.includes('Could not find') && !attempt.includes('No exact match')) {
+        const success = !attempt.includes('error') && !attempt.includes('Error');
+        return res.json({ ok: success, output: attempt });
+      }
+    }
+
+    if (!/^[\w.\-]+$/.test(skill)) return res.status(400).json({ ok: false, error: 'invalid skill name: ' + skill });
     const output = await execHermes([...profArg, 'skills', 'install', skill, '--yes'], 30000);
-    const success = !output.includes('error') && !output.includes('Error');
+    const success = !output.includes('error') && !output.includes('Error') && !output.includes('Could not find');
     res.json({ ok: success, output });
   } catch (e) {
     res.json({ ok: false, error: e.message });
